@@ -40,7 +40,9 @@ Operational guide for maintaining the `versitygw-oci` backend plugin.
 
 ## Releasing
 - CI runs on push and PR to `main`, `develop`, `release/**`.
-- Tagging `v*` publishes `ghcr.io/<owner>/versitygw-oci:<tag>`.
+- Tagging `v*` publishes `ghcr.io/<owner>/versitygw-oci:<tag>` AND creates a GitHub
+  release pinning the image digest. Tags must be semver (`v1.2.3`, `v1.2.3-rc.1`).
+- Implementation gotchas belong in `docs/traps.md`, not the README.
 - **Never re-push an existing tag.** Consumers that pin a tag with
   `imagePullPolicy: IfNotPresent` will not pick it up, and if the pod template is
   unchanged no rollout happens at all — the result is a fix that is merged, built,
