@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "develop", "release/**"]
+  pull_request:
+    branches: ["main", "develop", "release/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Cache Go modules
+        uses: actions/cache@v5.0.5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Go fmt
+        run: |
+          set -euo pipefail
+          fmt_files=$(find . -name '*.go' -not -path './vendor/*' -print0 | xargs -0 gofmt -l)
+
+          if [ -n "$fmt_files" ]; then
+            echo "The following files are not gofmt'd:" >&2
+            echo "$fmt_files" >&2
+            echo "Run 'gofmt -w' locally before pushing." >&2
+            exit 1
+          fi
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Go test
+        run: go test ./...
+
+      # The interface assertion in oci.go only fires under a real build, and
+      # -buildmode=plugin is the mode that actually ships. A plain `go build`
+      # would not catch a versitygw interface change.
+      - name: Build plugin
+        run: CGO_ENABLED=1 go build -buildmode=plugin -o out/oci.so .
+
+      - name: actionlint
+        uses: docker://rhysd/actionlint:latest
