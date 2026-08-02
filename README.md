@@ -53,10 +53,25 @@ compartment=<compartment-ocid>   # only for ListBuckets
 | `region` | e.g. `us-phoenix-1` | Falls back to `OCI_REGION` |
 | `auth` | `workload_identity`, `instance_principal`, `default` | Empty tries workload identity, then the default OCI chain |
 | `compartment` | Compartment OCID | Only needed for `ListBuckets`. Falls back to `OCI_COMPARTMENT_ID` |
+| `bucketOwners` | `bucket:account\|bucket:account` | Per-bucket ownership. Unmapped buckets stay root-owned |
 
 Throttles and transient 5xx are retried with exponential backoff; the OCI SDK applies no retry
 of its own. The one namespace lookup at startup is bounded at 15s so an unreachable OCI fails
 the gateway fast instead of hanging plugin load.
+
+### Per-account access
+
+By default every bucket is owned by the root account, so one credential reaches everything the
+gateway fronts. To separate consumers, give versitygw an account list (`--iam-dir` with a
+`users.json`) and map buckets to accounts:
+
+```
+bucketOwners=registry:harbor-acct|docs:techdocs-acct
+```
+
+`GetBucketAcl` then reports that owner, and versitygw's `verifyACL` denies any other account —
+so a credential leaked from one consumer cannot reach another's bucket. **Unmapped buckets keep
+the previous behaviour**, so mapping is opt-in and cannot break a consumer you have not migrated.
 
 ### Region matters more than it looks
 

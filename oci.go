@@ -64,6 +64,9 @@ type OCI struct {
 	client      objectstorage.ObjectStorageClient
 	namespace   string
 	compartment string
+	// bucket name -> owning account access key. Empty means every bucket is
+	// root-owned (single-account mode).
+	bucketOwners map[string]string
 }
 
 // Fails the build if a versitygw bump changes the Backend interface, rather
@@ -119,7 +122,12 @@ func newOCI(config string) (*OCI, error) {
 		RetryPolicy: &retryPolicy,
 	})
 
-	o := &OCI{client: client, namespace: ns, compartment: compartment}
+	o := &OCI{
+		client:       client,
+		namespace:    ns,
+		compartment:  compartment,
+		bucketOwners: parseBucketOwners(cfg["bucketowners"]),
+	}
 	if o.namespace == "" {
 		// One call at startup beats requiring the operator to hardcode a value
 		// they cannot easily look up. Bounded: this runs during plugin load, and
@@ -195,6 +203,20 @@ func parseConfig(s string) map[string]string {
 	return out
 }
 
+// parseBucketOwners parses `bucket:account|bucket:account`. Pipe-separated
+// because the outer config is already comma/space separated.
+func parseBucketOwners(s string) map[string]string {
+	out := map[string]string{}
+	for _, pair := range strings.Split(s, "|") {
+		bucket, account, ok := strings.Cut(strings.TrimSpace(pair), ":")
+		bucket, account = strings.TrimSpace(bucket), strings.TrimSpace(account)
+		if ok && bucket != "" && account != "" {
+			out[bucket] = account
+		}
+	}
+	return out
+}
+
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if v != "" {
@@ -246,18 +268,28 @@ func errorAs(err error, target *common.ServiceError) bool {
 	return errors.As(err, target)
 }
 
-// GetBucketAcl returns a minimal ACL.
+// GetBucketAcl reports bucket ownership.
 //
 // This is not optional: versitygw runs ParseAcl and AuthorizePublicBucketAccess
 // as middleware on EVERY route, both of which call GetBucketAcl. Leaving it to
 // BackendUnsupported makes the gateway answer 501 to every request before the
 // controller is ever reached, which is not obvious from the symptom.
 //
-// OCI Object Storage has no S3 ACL model. An empty ACL is correct here:
-// versitygw defaults the owner to the root account when Owner is unset. Real
-// access control lives in two places that actually enforce it — OCI IAM policy
-// on the gateway's workload identity, and versitygw's own IAM for client keys.
-func (o *OCI) GetBucketAcl(_ context.Context, _ *s3.GetBucketAclInput) ([]byte, error) {
+// OCI Object Storage has no S3 ACL model, so ownership comes from the
+// `bucketOwners` config instead. This is what makes per-account credentials
+// mean anything: versitygw's verifyACL denies when acl.Owner != the requesting
+// access key, so a bucket mapped to account A is unreachable by account B.
+//
+// With no mapping the ACL is empty and versitygw defaults the owner to the root
+// account — every bucket is then reachable only by root, which is the
+// single-shared-credential model. Mapping a bucket is therefore opt-in, and
+// unmapped buckets keep working exactly as before.
+func (o *OCI) GetBucketAcl(_ context.Context, in *s3.GetBucketAclInput) ([]byte, error) {
+	if in != nil && in.Bucket != nil {
+		if owner, ok := o.bucketOwners[*in.Bucket]; ok {
+			return json.Marshal(vgwauth.ACL{Owner: owner})
+		}
+	}
 	return json.Marshal(vgwauth.ACL{})
 }
 

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,8 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/objectstorage"
+	vgwauth "github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/s3err"
 )
 
@@ -328,5 +332,58 @@ func TestStreamingHTTPClientKeepsPerPhaseTimeouts(t *testing.T) {
 	// hung peer. Losing them would turn a dead connection into a hang forever.
 	if tr.ResponseHeaderTimeout == 0 || tr.TLSHandshakeTimeout == 0 {
 		t.Error("per-phase timeouts must stay set when the absolute timeout is removed")
+	}
+}
+
+func TestParseBucketOwners(t *testing.T) {
+	got := parseBucketOwners("bucket-a:acct1 | bucket-b:acct2|  :skipme |nope|bucket-c:")
+	want := map[string]string{"bucket-a": "acct1", "bucket-b": "acct2"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("owner[%q] = %q, want %q", k, got[k], v)
+		}
+	}
+	if len(parseBucketOwners("")) != 0 {
+		t.Error("empty config should map nothing")
+	}
+}
+
+// This is the whole point of per-account credentials: a mapped bucket reports
+// its owner, so versitygw's verifyACL denies any other account. An unmapped
+// bucket stays root-owned, which is the previous single-account behaviour — so
+// adding a mapping is opt-in and cannot break an unmapped consumer.
+func TestGetBucketAclOwnership(t *testing.T) {
+	o := &OCI{bucketOwners: map[string]string{"registry": "harbor-acct"}}
+
+	b, err := o.GetBucketAcl(context.Background(), &s3.GetBucketAclInput{Bucket: ptr("registry")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mapped vgwauth.ACL
+	if err := json.Unmarshal(b, &mapped); err != nil {
+		t.Fatal(err)
+	}
+	if mapped.Owner != "harbor-acct" {
+		t.Errorf("mapped bucket owner = %q, want harbor-acct", mapped.Owner)
+	}
+
+	b, err = o.GetBucketAcl(context.Background(), &s3.GetBucketAclInput{Bucket: ptr("unmapped")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var unmapped vgwauth.ACL
+	if err := json.Unmarshal(b, &unmapped); err != nil {
+		t.Fatal(err)
+	}
+	if unmapped.Owner != "" {
+		t.Errorf("unmapped bucket owner = %q, want empty (root)", unmapped.Owner)
+	}
+
+	// Must not panic on the nil input versitygw middleware can pass.
+	if _, err := o.GetBucketAcl(context.Background(), nil); err != nil {
+		t.Errorf("nil input: %v", err)
 	}
 }
