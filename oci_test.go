@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -231,5 +233,33 @@ func TestConvertVersions(t *testing.T) {
 	}
 	if vs, ms := convertVersions(nil); len(vs) != 0 || len(ms) != 0 {
 		t.Error("nil input should produce no versions or markers")
+	}
+}
+
+// The SDK wraps service errors on some paths (notably after a retry). A bare
+// type assertion misses those and collapses them into InternalError, which is
+// exactly the failure mapError exists to prevent. This is the regression test
+// for that: it passes with errors.As and fails with a type assertion.
+func TestMapErrorUnwrapsWrapped(t *testing.T) {
+	wrapped := fmt.Errorf("after 3 retries: %w", fakeSvcErr{status: 404, code: "BucketNotFound"})
+	if got := mapError(wrapped); got != s3err.GetAPIError(s3err.ErrNoSuchBucket) {
+		t.Errorf("wrapped BucketNotFound mapped to %v, want NoSuchBucket", got)
+	}
+
+	deep := fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", fakeSvcErr{status: 403, code: "NotAuthenticated"}))
+	if got := mapError(deep); got != s3err.GetAPIError(s3err.ErrAccessDenied) {
+		t.Errorf("doubly wrapped 403 mapped to %v, want AccessDenied", got)
+	}
+
+	if !isNotFound(fmt.Errorf("wrapped: %w", fakeSvcErr{status: 404, code: "ObjectNotFound"})) {
+		t.Error("isNotFound should see through a wrapped error")
+	}
+}
+
+// fakeSvcErr must satisfy the SDK interface by VALUE for errors.As to bind it.
+func TestFakeSvcErrSatisfiesServiceError(t *testing.T) {
+	var target common.ServiceError
+	if !errors.As(error(fakeSvcErr{status: 500, code: "x"}), &target) {
+		t.Fatal("errors.As could not bind fakeSvcErr — the other tests would be vacuous")
 	}
 }

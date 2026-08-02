@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -35,6 +36,15 @@ import (
 	"github.com/versity/versitygw/s3response"
 )
 
+// startupTimeout bounds the one namespace lookup done during plugin load. Plugin
+// load blocks the gateway starting, so an unreachable OCI must fail fast.
+const startupTimeout = 15 * time.Second
+
+// retryPolicy retries throttles and transient server errors with exponential
+// backoff. The SDK applies no retry unless one is set, so without this a single
+// 429 mid-upload fails the request outright.
+var retryPolicy = common.DefaultRetryPolicyWithoutEventualConsistency()
+
 // Backend is the symbol versitygw looks up in the .so.
 var Backend plugins.BackendPlugin = &ociPlugin{}
 
@@ -49,8 +59,9 @@ func (p *ociPlugin) New(config string) (backend.Backend, error) { return newOCI(
 type OCI struct {
 	backend.BackendUnsupported
 
-	client    objectstorage.ObjectStorageClient
-	namespace string
+	client      objectstorage.ObjectStorageClient
+	namespace   string
+	compartment string
 }
 
 // Fails the build if a versitygw bump changes the Backend interface, rather
@@ -69,6 +80,7 @@ func newOCI(config string) (*OCI, error) {
 
 	region := firstNonEmpty(cfg["region"], os.Getenv("OCI_REGION"))
 	ns := firstNonEmpty(cfg["namespace"], os.Getenv("OCI_NAMESPACE"))
+	compartment := firstNonEmpty(cfg["compartment"], os.Getenv("OCI_COMPARTMENT_ID"))
 
 	provider, err := configurationProvider(cfg["auth"])
 	if err != nil {
@@ -82,12 +94,21 @@ func newOCI(config string) (*OCI, error) {
 	if region != "" {
 		client.SetRegion(region)
 	}
+	// Retry throttles and transient 5xx rather than surfacing them to the S3
+	// client. Without this the SDK applies no retry of its own, so a single 429
+	// during a large multipart upload fails the whole part.
+	client.SetCustomClientConfiguration(common.CustomClientConfiguration{
+		RetryPolicy: &retryPolicy,
+	})
 
-	o := &OCI{client: client, namespace: ns}
+	o := &OCI{client: client, namespace: ns, compartment: compartment}
 	if o.namespace == "" {
 		// One call at startup beats requiring the operator to hardcode a value
-		// they can't easily look up.
-		resp, err := client.GetNamespace(context.Background(), objectstorage.GetNamespaceRequest{})
+		// they cannot easily look up. Bounded: this runs during plugin load, and
+		// an unreachable OCI must fail the gateway fast rather than hang it.
+		ctx, cancel := context.WithTimeout(context.Background(), startupTimeout)
+		defer cancel()
+		resp, err := client.GetNamespace(ctx, objectstorage.GetNamespaceRequest{})
 		if err != nil {
 			return nil, fmt.Errorf("resolve object storage namespace: %w", err)
 		}
@@ -180,12 +201,12 @@ func mapError(err error) error {
 	return err
 }
 
+// errorAs unwraps rather than type-asserting. The SDK wraps service errors on
+// some paths (notably after a retry), and a bare assertion silently misses those
+// — which collapses every mapped error back into InternalError, defeating the
+// point of mapError.
 func errorAs(err error, target *common.ServiceError) bool {
-	if se, ok := err.(common.ServiceError); ok {
-		*target = se
-		return true
-	}
-	return false
+	return errors.As(err, target)
 }
 
 // GetBucketAcl returns a minimal ACL.
@@ -228,9 +249,9 @@ func (o *OCI) GetBucketVersioning(_ context.Context, _ string) (s3response.GetBu
 }
 
 func (o *OCI) ListBuckets(ctx context.Context, in s3response.ListBucketsInput) (s3response.ListAllMyBucketsResult, error) {
-	compartment := os.Getenv("OCI_COMPARTMENT_ID")
+	compartment := o.compartment
 	if compartment == "" {
-		return s3response.ListAllMyBucketsResult{}, fmt.Errorf("OCI_COMPARTMENT_ID must be set to list buckets")
+		return s3response.ListAllMyBucketsResult{}, fmt.Errorf("compartment must be set (config `compartment=` or OCI_COMPARTMENT_ID) to list buckets")
 	}
 
 	var entries []s3response.ListAllMyBucketsEntry

@@ -44,6 +44,7 @@ Config file — `key=value`, comma or whitespace separated:
 namespace=<object-storage-namespace>
 region=<oci-region>
 auth=workload_identity
+compartment=<compartment-ocid>   # only for ListBuckets
 ```
 
 | Key | Values | Notes |
@@ -51,8 +52,11 @@ auth=workload_identity
 | `namespace` | Object Storage namespace | Resolved automatically via `GetNamespace` if omitted |
 | `region` | e.g. `us-phoenix-1` | Falls back to `OCI_REGION` |
 | `auth` | `workload_identity`, `instance_principal`, `default` | Empty tries workload identity, then the default OCI chain |
+| `compartment` | Compartment OCID | Only needed for `ListBuckets`. Falls back to `OCI_COMPARTMENT_ID` |
 
-`OCI_COMPARTMENT_ID` is required only for `ListBuckets`.
+Throttles and transient 5xx are retried with exponential backoff; the OCI SDK applies no retry
+of its own. The one namespace lookup at startup is bounded at 15s so an unreachable OCI fails
+the gateway fast instead of hanging plugin load.
 
 ### Region matters more than it looks
 
