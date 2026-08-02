@@ -41,3 +41,25 @@ Give fronted buckets an abort-incomplete-multipart lifecycle rule.
 
 **Newer AWS SDKs send CRC32 trailers by default.** If a client fails with `NotImplemented` on
 upload, set `request_checksum_calculation=when_required` (or the equivalent for your SDK).
+
+**The SDK's default HTTP client kills slow reads at 60 seconds.**
+`objectstorage.NewObjectStorageClientWithConfigurationProvider` returns a client whose
+`http.Client` carries an absolute `Timeout: 60s`, and that deadline covers the response *body*.
+A `GetObject` therefore dies mid-stream whenever the consumer reads slower than
+`size / 60s` — the failure is **time-based, not size-based**, so it moves around:
+
+```
+3.86 GB object, consumed at 110 MB/s   COMPLETE 3855521197 bytes in 35.1s
+3.86 GB object, consumed at  33 MB/s   FAILED after 2.07 GB in 62.4s
+3.86 GB object, consumed at  26 MB/s   FAILED after 1.62 GB in 62.5s
+```
+
+Writes never hit it: multipart splits an upload into part requests that each finish well inside
+60s. Reads are a single request, so only a large object with a slow consumer trips it — which is
+exactly a PostgreSQL base-backup restore, where `barman-cloud-restore` decompresses and untars
+as it reads. The symptom is `Connection broken: IncompleteRead(N bytes read, M more expected)`
+in the *client*, with nothing at all in the gateway logs, so it reads like a network fault.
+
+It also means a backup can be written, verified present, and be completely unrestorable. Fixed
+by replacing the dispatcher with one that has no absolute timeout and keeps per-phase bounds
+(`streamingHTTPClient`).
