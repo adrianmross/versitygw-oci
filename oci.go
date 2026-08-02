@@ -20,6 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -91,6 +93,22 @@ func newOCI(config string) (*OCI, error) {
 	if err != nil {
 		return nil, fmt.Errorf("oci object storage client: %w", err)
 	}
+	// The SDK's default http.Client carries an absolute 60s Timeout that covers
+	// the whole exchange INCLUDING the response body, so a GetObject dies
+	// mid-stream whenever the client reads slower than size/60s. That is
+	// time-based, not size-based: the same 3.86GB object completes when consumed
+	// at 110 MB/s and breaks at 62s when consumed at 26 MB/s, at a different byte
+	// offset each time.
+	//
+	// Writes never hit it because multipart splits an upload into sub-60s part
+	// requests. Reads are one request, so this only surfaces on a large object
+	// with a slow consumer — which is exactly a Postgres base-backup restore,
+	// where barman decompresses and untars as it reads.
+	//
+	// Timeout: 0 means no deadline on the body. The per-phase timeouts below
+	// still bound connect, TLS and time-to-first-byte, so a genuinely hung peer
+	// is still caught.
+	client.HTTPClient = streamingHTTPClient()
 	if region != "" {
 		client.SetRegion(region)
 	}
@@ -115,6 +133,25 @@ func newOCI(config string) (*OCI, error) {
 		o.namespace = *resp.Value
 	}
 	return o, nil
+}
+
+// streamingHTTPClient replaces the SDK's default dispatcher for the reason
+// documented at its call site: no absolute deadline on the body, but every other
+// phase still bounded.
+func streamingHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 0,
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 60 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
 }
 
 func configurationProvider(mode string) (common.ConfigurationProvider, error) {

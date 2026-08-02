@@ -3,6 +3,9 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
@@ -261,5 +264,69 @@ func TestFakeSvcErrSatisfiesServiceError(t *testing.T) {
 	var target common.ServiceError
 	if !errors.As(error(fakeSvcErr{status: 500, code: "x"}), &target) {
 		t.Fatal("errors.As could not bind fakeSvcErr — the other tests would be vacuous")
+	}
+}
+
+// A slow reader of a large object must not be killed part-way through.
+//
+// This is the bug that made Postgres base backups unrestorable: the SDK's
+// default dispatcher sets an absolute http.Client.Timeout covering the response
+// body, so a GetObject died at ~62s regardless of how much was left. It is
+// time-based, not size-based — the same object completed when read fast and
+// broke at a different offset each time when read slowly.
+//
+// The server here trickles its body for longer than the deadline given to the
+// "default-like" client, so a client with an absolute timeout must fail and
+// streamingHTTPClient must not.
+func TestStreamingHTTPClientSurvivesASlowBody(t *testing.T) {
+	const chunks = 12
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		for i := 0; i < chunks; i++ {
+			_, _ = w.Write([]byte("payload"))
+			w.(http.Flusher).Flush()
+			time.Sleep(50 * time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+
+	read := func(c *http.Client) (int, error) {
+		resp, err := c.Get(srv.URL)
+		if err != nil {
+			return 0, err
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		return len(b), err
+	}
+
+	// Stand-in for the SDK default: an absolute timeout shorter than the body.
+	if _, err := read(&http.Client{Timeout: 200 * time.Millisecond}); err == nil {
+		t.Fatal("a client with an absolute timeout should have failed on a slow body; " +
+			"if this stops failing the test no longer proves anything")
+	}
+
+	n, err := read(streamingHTTPClient())
+	if err != nil {
+		t.Fatalf("streamingHTTPClient failed on a slow body: %v", err)
+	}
+	if want := chunks * len("payload"); n != want {
+		t.Errorf("read %d bytes, want %d", n, want)
+	}
+}
+
+func TestStreamingHTTPClientKeepsPerPhaseTimeouts(t *testing.T) {
+	c := streamingHTTPClient()
+	if c.Timeout != 0 {
+		t.Errorf("Timeout = %v, want 0 — an absolute deadline breaks large reads", c.Timeout)
+	}
+	tr, ok := c.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport is %T, want *http.Transport", c.Transport)
+	}
+	// Dropping the absolute timeout is only safe because these still bound a
+	// hung peer. Losing them would turn a dead connection into a hang forever.
+	if tr.ResponseHeaderTimeout == 0 || tr.TLSHandshakeTimeout == 0 {
+		t.Error("per-phase timeouts must stay set when the absolute timeout is removed")
 	}
 }
