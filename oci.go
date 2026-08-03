@@ -292,7 +292,33 @@ func errorAs(err error, target *common.ServiceError) bool {
 func (o *OCI) GetBucketAcl(_ context.Context, in *s3.GetBucketAclInput) ([]byte, error) {
 	if in != nil && in.Bucket != nil {
 		if owner, ok := o.bucketOwners[*in.Bucket]; ok {
-			return json.Marshal(vgwauth.ACL{Owner: owner})
+			// Owner AND a self-grantee, because versitygw checks ownership two
+			// different ways and only one of them reads Owner.
+			//
+			// verifyACL compares acl.Owner to the requesting key only when ACLs
+			// are disabled; otherwise it matches grantees. VerifyObjectCopyAccess
+			// re-verifies the COPY SOURCE by building a fresh AccessOptions that
+			// does not carry DisableACL through, so the source check always takes
+			// the grantee path — and an owner-only ACL has no grantees, so the
+			// bucket owner is denied on its own object.
+			//
+			// The visible symptom is narrow and misleading: PutObject and
+			// GetObject succeed, CopyObject returns AccessDenied. A container
+			// registry commits every blob by copying it to its content-addressed
+			// key, so pushes fail at the final step while pulls are unaffected.
+			//
+			// Granting the owner FullControl satisfies both paths (verifyACL
+			// matches any requested permission against a FullControl grantee) and
+			// widens nothing: it names the same account that already owns the
+			// bucket, so a non-owner still matches neither.
+			return json.Marshal(vgwauth.ACL{
+				Owner: owner,
+				Grantees: []vgwauth.Grantee{{
+					Access:     owner,
+					Permission: vgwauth.PermissionFullControl,
+					Type:       types.TypeCanonicalUser,
+				}},
+			})
 		}
 	}
 	return json.Marshal(vgwauth.ACL{})
