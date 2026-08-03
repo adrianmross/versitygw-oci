@@ -73,6 +73,11 @@ bucketOwners=registry:harbor-acct|docs:techdocs-acct
 so a credential leaked from one consumer cannot reach another's bucket. **Unmapped buckets keep
 the previous behaviour**, so mapping is opt-in and cannot break a consumer you have not migrated.
 
+**versitygw must run with `--disable-acl`.** An owner-only ACL carries no grantees, and with ACLs
+enabled `verifyACL` matches grantees and so denies *the owner too*. `--disable-acl` selects the
+`acl.Owner != access` comparison, which is the check this mapping is built for. Without it every
+mapped bucket returns `AccessDenied` to everyone but root.
+
 ### Region matters more than it looks
 
 versitygw verifies the SigV4 credential scope against its own `--region`. Set it to the region your

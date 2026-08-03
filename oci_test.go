@@ -387,3 +387,53 @@ func TestGetBucketAclOwnership(t *testing.T) {
 		t.Errorf("nil input: %v", err)
 	}
 }
+
+// Drives the REAL versitygw authorization chain rather than GetBucketAcl alone.
+// Asserting on the ACL in isolation is what let an unimplemented
+// GetBucketPolicy ship: VerifyAccess consults the policy first and fails the
+// request outright on any error but ErrNoSuchBucketPolicy, so ownership was
+// correct and unreachable. Anything that breaks the chain — a missing method, a
+// changed short-circuit — fails here, which is the only assertion that matches
+// what a client actually experiences.
+//
+// Note versitygw must run with `--disable-acl`. An owner-only ACL carries no
+// grantees, and with ACLs enabled verifyACL matches grantees and denies even the
+// owner; --disable-acl selects the `acl.Owner != access` comparison instead.
+func TestVerifyAccessSeparatesAccounts(t *testing.T) {
+	be := &OCI{bucketOwners: map[string]string{"owned": "acct-a"}}
+	ctx := context.Background()
+
+	access := func(bucket, account string, disableACL bool) error {
+		aclBytes, err := be.GetBucketAcl(ctx, &s3.GetBucketAclInput{Bucket: ptr(bucket)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		acl, err := vgwauth.ParseACL(aclBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return vgwauth.VerifyAccess(ctx, be, vgwauth.AccessOptions{
+			Acl:           acl,
+			AclPermission: vgwauth.PermissionRead,
+			Acc:           vgwauth.Account{Access: account, Role: vgwauth.RoleUser},
+			Bucket:        bucket,
+			Actions:       []vgwauth.Action{vgwauth.GetObjectAction},
+			DisableACL:    disableACL,
+		})
+	}
+
+	if err := access("owned", "acct-a", true); err != nil {
+		t.Errorf("owner denied on its own bucket: %v", err)
+	}
+
+	denied := s3err.GetAPIError(s3err.ErrAccessDenied)
+	// The assertion the whole feature exists for.
+	if err := access("owned", "acct-b", true); err != denied {
+		t.Errorf("non-owner on a mapped bucket = %v, want AccessDenied", err)
+	}
+	// Unmapped buckets are root-owned, so a named account reaches nothing —
+	// this is what keeps un-migrated consumers on the root credential.
+	if err := access("unmapped", "acct-a", true); err != denied {
+		t.Errorf("named account on an unmapped bucket = %v, want AccessDenied", err)
+	}
+}
