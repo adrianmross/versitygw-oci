@@ -185,6 +185,11 @@ func configurationProvider(mode string) (common.ConfigurationProvider, error) {
 // versitygw's `plugin --config` passes a *file path*, so a value naming a
 // readable file is read and its contents parsed. An inline string is also
 // accepted, which keeps tests and local runs simple.
+//
+// Keys are lower-cased. Every lookup below is lower-case, so a config written
+// as `bucketOwners=` — which is how the README spells it — would otherwise be
+// silently ignored, and a dropped ownership map reads as "the bucket is still
+// root-owned", not as a typo.
 func parseConfig(s string) map[string]string {
 	if s != "" {
 		if data, err := os.ReadFile(s); err == nil {
@@ -197,7 +202,7 @@ func parseConfig(s string) map[string]string {
 	}) {
 		k, v, ok := strings.Cut(field, "=")
 		if ok {
-			out[strings.TrimSpace(k)] = strings.TrimSpace(v)
+			out[strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
 		}
 	}
 	return out
@@ -291,6 +296,22 @@ func (o *OCI) GetBucketAcl(_ context.Context, in *s3.GetBucketAclInput) ([]byte,
 		}
 	}
 	return json.Marshal(vgwauth.ACL{})
+}
+
+// GetBucketPolicy reports that no bucket policy is configured.
+//
+// Not optional either, and reachable only once a NON-root account exists, which
+// is why single-account mode never surfaced it: auth.VerifyAccess returns early
+// for root and admin, but for any other account it calls GetBucketPolicy BEFORE
+// it looks at the ACL and treats every error except ErrNoSuchBucketPolicy as
+// fatal. Left to BackendUnsupported that is ErrNotImplemented, so a per-consumer
+// account gets 501 on every request and the ownership check in GetBucketAcl is
+// never reached — bucketOwners looks broken when it is simply unread.
+//
+// OCI Object Storage has no S3 bucket-policy model. Ownership via bucketOwners
+// is the whole authorization story here.
+func (o *OCI) GetBucketPolicy(_ context.Context, _ string) ([]byte, error) {
+	return nil, s3err.GetAPIError(s3err.ErrNoSuchBucketPolicy)
 }
 
 // GetObjectLockConfiguration reports that no object lock is configured.
