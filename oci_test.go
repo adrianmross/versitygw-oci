@@ -437,3 +437,45 @@ func TestVerifyAccessSeparatesAccounts(t *testing.T) {
 		t.Errorf("named account on an unmapped bucket = %v, want AccessDenied", err)
 	}
 }
+
+// Drives VerifyObjectCopyAccess, which is a SEPARATE path from VerifyAccess and
+// fails differently. It re-checks the copy SOURCE through a fresh AccessOptions
+// that does not carry DisableACL, so the source check always matches grantees —
+// meaning an Owner-only ACL denies the bucket owner its own copy.
+//
+// The symptom is narrow enough to slip through everything else: PutObject and
+// GetObject succeed and only CopyObject fails. That is a container registry's
+// blob commit, so pushes break at the last step while pulls stay healthy. It
+// cost a revert of the Harbor migration to find, which is why it is asserted
+// here and not just reasoned about.
+func TestVerifyObjectCopyAccessAllowsBucketOwner(t *testing.T) {
+	be := &OCI{bucketOwners: map[string]string{"owned": "acct-a"}}
+	ctx := context.Background()
+
+	copyAccess := func(account string) error {
+		aclBytes, err := be.GetBucketAcl(ctx, &s3.GetBucketAclInput{Bucket: ptr("owned")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		acl, err := vgwauth.ParseACL(aclBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return vgwauth.VerifyObjectCopyAccess(ctx, be, "owned/src", vgwauth.AccessOptions{
+			Acl:           acl,
+			AclPermission: vgwauth.PermissionWrite,
+			Acc:           vgwauth.Account{Access: account, Role: vgwauth.RoleUser},
+			Bucket:        "owned",
+			Object:        "dst",
+			Actions:       []vgwauth.Action{vgwauth.PutObjectAction},
+			DisableACL:    true,
+		})
+	}
+
+	if err := copyAccess("acct-a"); err != nil {
+		t.Errorf("bucket owner denied on its own copy: %v", err)
+	}
+	if err := copyAccess("acct-b"); err != s3err.GetAPIError(s3err.ErrAccessDenied) {
+		t.Errorf("non-owner copy = %v, want AccessDenied", err)
+	}
+}
