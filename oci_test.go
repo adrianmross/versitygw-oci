@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -477,5 +478,90 @@ func TestVerifyObjectCopyAccessAllowsBucketOwner(t *testing.T) {
 	}
 	if err := copyAccess("acct-b"); err != s3err.GetAPIError(s3err.ErrAccessDenied) {
 		t.Errorf("non-owner copy = %v, want AccessDenied", err)
+	}
+}
+
+// errReader yields some bytes and then a non-EOF failure, which is what a
+// mid-stream transport break looks like to the body wrapper.
+type errReader struct {
+	data []byte
+	off  int
+	err  error
+}
+
+func (r *errReader) Read(p []byte) (int, error) {
+	if r.off >= len(r.data) {
+		return 0, r.err
+	}
+	n := copy(p, r.data[r.off:])
+	r.off += n
+	return n, nil
+}
+
+func (r *errReader) Close() error { return nil }
+
+func TestLoggingBodyCountsAndClassifies(t *testing.T) {
+	boom := errors.New("connection reset by peer")
+
+	cases := []struct {
+		name     string
+		body     io.ReadCloser
+		expected int64
+		wantRead int64
+		wantErr  bool // a non-EOF read error was captured
+	}{
+		{
+			name:     "complete read records no error",
+			body:     io.NopCloser(bytes.NewReader(make([]byte, 100))),
+			expected: 100,
+			wantRead: 100,
+		},
+		{
+			name:     "short read is counted",
+			body:     io.NopCloser(bytes.NewReader(make([]byte, 40))),
+			expected: 100,
+			wantRead: 40,
+		},
+		{
+			name:     "mid-stream failure is captured, not swallowed",
+			body:     &errReader{data: make([]byte, 25), err: boom},
+			expected: 100,
+			wantRead: 25,
+			wantErr:  true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			lb := &loggingBody{rc: tc.body, bucket: "b", key: "k", expected: tc.expected}
+			// Drain exactly as versitygw does: read until any error.
+			buf := make([]byte, 8)
+			for {
+				_, err := lb.Read(buf)
+				if err != nil {
+					break
+				}
+			}
+			if lb.read != tc.wantRead {
+				t.Fatalf("read = %d, want %d", lb.read, tc.wantRead)
+			}
+			if tc.wantErr && lb.readErr == nil {
+				t.Fatal("expected a non-EOF read error to be captured")
+			}
+			if !tc.wantErr && lb.readErr != nil {
+				t.Fatalf("unexpected readErr: %v", lb.readErr)
+			}
+			if err := lb.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			// Close must be idempotent: versitygw and the SDK can both close it,
+			// and double-logging a truncation would be worse than not logging it.
+			if err := lb.Close(); err != nil {
+				t.Fatalf("second Close: %v", err)
+			}
+			if !lb.closed {
+				t.Fatal("closed flag not set")
+			}
+		})
 	}
 }

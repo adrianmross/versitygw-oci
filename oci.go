@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -459,8 +460,17 @@ func (o *OCI) GetObject(ctx context.Context, in *s3.GetObjectInput) (*s3.GetObje
 	if err != nil {
 		return nil, mapError(err)
 	}
+	body := resp.Content
+	if body != nil {
+		body = &loggingBody{
+			rc:       body,
+			bucket:   derefStr(in.Bucket),
+			key:      derefStr(in.Key),
+			expected: derefInt64(resp.ContentLength),
+		}
+	}
 	out := &s3.GetObjectOutput{
-		Body:          resp.Content,
+		Body:          body,
 		ContentLength: resp.ContentLength,
 		ContentType:   resp.ContentType,
 		Metadata:      resp.OpcMeta,
@@ -983,6 +993,78 @@ func nilIfEmpty(p *string) *string {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+func derefStr(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+func derefInt64(v *int64) int64 {
+	if v == nil {
+		return 0
+	}
+	return *v
+}
+
+// loggingBody wraps a GetObject body so a transfer that ends early leaves a
+// record somewhere.
+//
+// versitygw writes its access-log line when response *headers* are sent. For a
+// streaming GetObject the body is written long afterwards, so a stream that dies
+// mid-body is logged as a clean 200 and the failure is invisible from the server
+// side. That is how the 60s read-timeout bug (fixed in v0.1.2) stayed latent from
+// first release until a restore drill went looking for it, and why a truncated
+// 470MB registry layer observed on 2026-08-03 left no server-side trace at all.
+// Clients that verify digests turn this into a failed pull; clients that do not
+// get silent corruption. See issue #5.
+//
+// Two cases are deliberately distinguished, because they are not equally
+// alarming:
+//
+//   - a non-EOF error from the underlying reader is unambiguous: the transfer
+//     broke. Logged as FAILED.
+//   - Close() with fewer bytes read than advertised, and no error, is usually a
+//     client that hung up early (an aborted image pull is routine). It is logged
+//     too, because it is also the signature of a silent upstream truncation, and
+//     today there is no record of either.
+type loggingBody struct {
+	rc       io.ReadCloser
+	bucket   string
+	key      string
+	expected int64
+	read     int64
+	readErr  error
+	closed   bool
+}
+
+func (b *loggingBody) Read(p []byte) (int, error) {
+	n, err := b.rc.Read(p)
+	b.read += int64(n)
+	if err != nil && !errors.Is(err, io.EOF) {
+		b.readErr = err
+	}
+	return n, err
+}
+
+func (b *loggingBody) Close() error {
+	err := b.rc.Close()
+	if b.closed {
+		return err
+	}
+	b.closed = true
+
+	switch {
+	case b.readErr != nil:
+		log.Printf("versitygw-oci: GetObject %s/%s FAILED mid-body after %d of %d bytes: %v",
+			b.bucket, b.key, b.read, b.expected, b.readErr)
+	case b.expected > 0 && b.read < b.expected:
+		log.Printf("versitygw-oci: GetObject %s/%s short body: %d of %d bytes written",
+			b.bucket, b.key, b.read, b.expected)
+	}
+	return err
+}
 
 func deref[T any](p *T) T {
 	if p == nil {
