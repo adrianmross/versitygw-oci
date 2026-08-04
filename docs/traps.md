@@ -81,3 +81,24 @@ it is unreachable until a second account exists.
 matches grantees instead, and an owner-only ACL has none — so the owner is denied along with
 everyone else. Test the authorization chain through `auth.VerifyAccess`, not by asserting on
 `GetBucketAcl`'s output: the ACL can be perfectly correct while every request 501s or 403s.
+
+**The access log reports a 200 before the body is written.** versitygw writes its access-log
+line when response *headers* are sent. For a streaming `GetObject` the body follows long
+afterwards, so a transfer that dies mid-body is recorded as a clean `200` and the failure has
+no server-side trace at all. This is what let the 60s read-timeout bug stay latent from first
+release until a restore drill went looking, and why a truncated 470MB registry layer observed
+downstream left nothing in the logs to correlate against.
+
+It is worse than a missing log line, because the absence is indistinguishable from success: the
+gateway looks healthy, the client sees a short body, and the two never meet. Clients that verify
+digests (containerd, docker) turn it into a failed pull; clients that do not get silent
+corruption.
+
+`loggingBody` in `GetObject` now wraps the body and logs on `Close`, distinguishing the two
+cases that are not equally alarming: a non-EOF error from the underlying reader means the
+transfer broke, while a short read with no error is usually a client that hung up early — an
+aborted image pull is routine. Both are logged, because a silent upstream truncation looks
+exactly like the second one and previously produced no record either way.
+
+Note this only covers the read path. A write that dies mid-stream is still invisible, and the
+counter is per-request state rather than a metric, so it is greppable but not alertable.
