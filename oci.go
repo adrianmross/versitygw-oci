@@ -437,6 +437,26 @@ func (o *OCI) PutObject(ctx context.Context, in s3response.PutObjectInput) (s3re
 	if in.CacheControl != nil {
 		req.CacheControl = in.CacheControl
 	}
+	// Conditional write, forwarded to OCI rather than evaluated here.
+	//
+	// versitygw parses If-Match/If-None-Match in s3api/utils/precondition.go and
+	// hands them over on PutObjectInput; this backend used to drop them, so every
+	// conditional PUT was an unconditional one. That is not a missing feature so
+	// much as a silent lie: the caller asks for compare-and-swap, gets an
+	// unconditional overwrite, and is told it succeeded.
+	//
+	// Buzz's git-on-object-storage design is the concrete case. It serialises
+	// concurrent ref updates with `PUT pointer If-Match: <etag>` and requires
+	// exactly one winner; its startup probe races 32 writers and refuses to boot
+	// unless 31 of them lose. Against this backend all 32 won.
+	//
+	// Forwarded, NOT evaluated locally. The Azure backend does a read-then-write
+	// via evaluateWritePreconditions, which cannot be linearizable across
+	// replicas — two gateways can both read the same ETag and both proceed. OCI
+	// enforces the precondition server-side and returns 412, which mapError
+	// already translates to ErrPreconditionFailed.
+	req.IfMatch = in.IfMatch
+	req.IfNoneMatch = in.IfNoneMatch
 	resp, err := o.client.PutObject(ctx, req)
 	if err != nil {
 		return s3response.PutObjectOutput{}, mapError(err)
@@ -797,11 +817,18 @@ func (o *OCI) CompleteMultipartUpload(ctx context.Context, in *s3.CompleteMultip
 			})
 		}
 	}
+	// Same forwarding as PutObject: the commit is the write that publishes a
+	// multipart object, so a conditional multipart upload has to carry its
+	// precondition here or it silently becomes unconditional. Both sides support
+	// it — s3.CompleteMultipartUploadInput has If-Match/If-None-Match, and so
+	// does objectstorage.CommitMultipartUploadRequest.
 	resp, err := o.client.CommitMultipartUpload(ctx, objectstorage.CommitMultipartUploadRequest{
 		NamespaceName: &o.namespace,
 		BucketName:    in.Bucket,
 		ObjectName:    in.Key,
 		UploadId:      in.UploadId,
+		IfMatch:       in.IfMatch,
+		IfNoneMatch:   in.IfNoneMatch,
 		CommitMultipartUploadDetails: objectstorage.CommitMultipartUploadDetails{
 			PartsToCommit: parts,
 		},

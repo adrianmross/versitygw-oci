@@ -18,6 +18,7 @@ import (
 	"github.com/oracle/oci-go-sdk/v65/objectstorage"
 	vgwauth "github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/s3err"
+	"github.com/versity/versitygw/s3response"
 )
 
 func TestParseConfig(t *testing.T) {
@@ -565,3 +566,139 @@ func TestLoggingBodyCountsAndClassifies(t *testing.T) {
 		})
 	}
 }
+
+// The bug this guards is not "the feature is missing" but "the feature lies":
+// versitygw parses If-Match and hands it over on PutObjectInput, and the backend
+// used to drop it, so a caller asking for compare-and-swap got an unconditional
+// overwrite reported as success. Buzz's git object store races 32 conditional
+// writers and requires 31 to lose; against the old backend all 32 won.
+//
+// Asserting on the wire rather than on the request struct is deliberate: the
+// SDK only emits a header if the field carries `contributesTo:"header"`, so a
+// struct-level assertion would pass even if the header never left the process.
+func TestPutObjectForwardsConditionalWriteHeaders(t *testing.T) {
+	var gotIfMatch, gotIfNoneMatch string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotIfMatch = r.Header.Get("if-match")
+		gotIfNoneMatch = r.Header.Get("if-none-match")
+		w.Header().Set("ETag", "\"new-etag\"")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	o := &OCI{namespace: "examplens", client: testClient(t, srv.URL)}
+	if _, err := o.PutObject(context.Background(), s3response.PutObjectInput{
+		Bucket:      ptr("b"),
+		Key:         ptr("k"),
+		Body:        bytes.NewReader([]byte("x")),
+		IfMatch:     ptr("etag-abc"),
+		IfNoneMatch: ptr("*"),
+	}); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+	if gotIfMatch != "etag-abc" {
+		t.Errorf("if-match header = %q, want %q — a conditional write became unconditional", gotIfMatch, "etag-abc")
+	}
+	if gotIfNoneMatch != "*" {
+		t.Errorf("if-none-match header = %q, want %q", gotIfNoneMatch, "*")
+	}
+}
+
+// A PUT with no preconditions must not grow them. If these were sent as empty
+// strings rather than omitted, OCI would evaluate a precondition nobody asked
+// for and unconditional writes would start failing.
+func TestPutObjectOmitsAbsentConditionalHeaders(t *testing.T) {
+	seen := map[string][]string{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen["if-match"] = r.Header.Values("if-match")
+		seen["if-none-match"] = r.Header.Values("if-none-match")
+		w.Header().Set("ETag", "\"e\"")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	o := &OCI{namespace: "examplens", client: testClient(t, srv.URL)}
+	if _, err := o.PutObject(context.Background(), s3response.PutObjectInput{
+		Bucket: ptr("b"), Key: ptr("k"), Body: bytes.NewReader([]byte("x")),
+	}); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+	for h, v := range seen {
+		if len(v) != 0 {
+			t.Errorf("%s was sent as %q on an unconditional PUT; it must be omitted", h, v)
+		}
+	}
+}
+
+// OCI answers a lost race with 412. The gateway has to surface S3's
+// PreconditionFailed, because that specific code is what a CAS client retries
+// on — anything else and the caller treats a lost race as a hard failure.
+func TestPreconditionFailureMapsToS3PreconditionFailed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusPreconditionFailed)
+		_, _ = w.Write([]byte(`{"code":"PreconditionFailed","message":"etag mismatch"}`))
+	}))
+	defer srv.Close()
+
+	o := &OCI{namespace: "examplens", client: testClient(t, srv.URL)}
+	_, err := o.PutObject(context.Background(), s3response.PutObjectInput{
+		Bucket: ptr("b"), Key: ptr("k"), Body: bytes.NewReader([]byte("x")), IfMatch: ptr("stale"),
+	})
+	if err == nil {
+		t.Fatal("a 412 from OCI must not be reported as success")
+	}
+	want := s3err.GetAPIError(s3err.ErrPreconditionFailed)
+	var got s3err.APIError
+	if !errors.As(err, &got) || got.Code != want.Code {
+		t.Fatalf("error = %v, want code %q", err, want.Code)
+	}
+}
+
+// An objectstorage client pointed at a local fake. AGENTS.md says unit tests
+// must not hit OCI; this hits an httptest server, the same way the streaming
+// client test does, and exercises only request construction.
+func testClient(t *testing.T, endpoint string) objectstorage.ObjectStorageClient {
+	t.Helper()
+	c, err := objectstorage.NewObjectStorageClientWithConfigurationProvider(
+		common.NewRawConfigurationProvider(
+			"ocid1.tenancy.oc1..aaaa", "ocid1.user.oc1..aaaa", "us-phoenix-1",
+			"a1:b2:c3", testPrivateKeyPEM, nil,
+		),
+	)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	c.Host = endpoint
+	return c
+}
+
+// A throwaway RSA key, generated for this file and used nowhere else. The SDK
+// requires a signer to build a request; the fake endpoint never verifies it.
+const testPrivateKeyPEM = `-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC8Dee4CBF0tKj/
+7Xq9DZSn170xe3Lr5pLPgaHTkGnPi/qb2tkzWxXPtg6REnrGNYWukRTYmaVa4uh3
+xszMEvE+jJtX4MLXF444iWi8RT4cVRU3G3ZMjdSSjROY9sd4jYK9t9A70DGI+mZP
+gtAE73vn5k7Bjg+rfES52sebiEM9zTDF5l6Tm2H4vSjQmrtmgBZ2/V56xtCDTPLv
+7IkfuIj9lDlrerP80mFUBCaNjqOv9zY46SeBSDRRPh8T2ROq5H7cgvSn3aIC5L0/
+SGOEwVX4XECkpn0Hcdoktmm0Xyhv6Rsn8BWRBuXPAbABzDTq6KYueZt+SHqHyIoN
++nz/26RpAgMBAAECggEAA+pUM0AzwNbMF/wFTK9eM3pp7YBQ/blgwCJGUMXWdiRH
+dPxC/m88joUPW5TjaoINxPsvUG0uhKxpw6inde5FCJTb3SIIXHsYknPF8vmMGAHr
+fai8N07SqLR4PnyQ3aEwoiuUEdK9XUk9XRVvqFKmJUdlx2DiUaM2ORplgob9Q2mb
+oY6A20DuXHo/hauAaHcOcB//8g4Dt5elDGn8Jr9jSE4et3YqrSlhVP3uGWReJj5r
+Uctd/XhUB6SlCh+Z7QsYY9Fs13z7roKTv6wN+S9bc/+ELR2B5srXNeuQW6hV4eue
+QsZ0mwzb2LojUFzNAtaGUUHuxhlMrMo75E7wagknaQKBgQDfHCJyBXkRtINItRsH
+jstLCm9tgHrm6lGQHr0R2/vXcXlJpCf0YP6pYl6ITNLaBD/3eAiFG47UfI2Va7tI
+/3CT/Tbm6v43etNwyf1iTg//LymN7dnPUHlI7cso/qHc3gcgcncOLXT37bNlvw9G
+EAo1n3oIuUKVKGlUu3y4JtUWZQKBgQDXxtIC7UthK0C5MVn6NEz32sonAB69fPWj
+KGt9gYx4kfCIGzV0aFDz0SP1nuwXOnpCLyjoCGuDq6m/07XYDppkFmWKDHRBogDt
+en1CFVRBnNU7veT4tEyGMK0ZpQFkSXahPJvCiIlpgH/oC17GNdrwjXNTWZmXTuEA
+4EQJJOcjtQKBgQCZENJI65xOG0vee/GZU8wBJZ2gwH6RIbznZU9Ni2DSRBV0Al0u
++cR9LPGyDRKzZCsGeqFNwMRS30i7dHe+8xCnVxdtgVb7dRbO0KU35lpvNkoKB15h
+LtKmyA2TiG4/+0tkZWNspJ8U4U0sxtGRvbtjYo/0oDUf4+OvsBk2td2HSQKBgD6S
+pII+yBZEkb9ipWIeWpehte+7ZC61FxKafRlnQRIR2DvQEB9SxO7/njrzPCm8Ron8
+3RL0piEH3fEH9vrRuUn/CLEQzYHe9f/n/nz0bHuefGOXvNe2iV58rSX7qLypZSJ6
+zfyK1bZnki/7ZB98rKIHkwL/v7+WGz/CyVgRgInlAoGBAJ6aQi9/GojkXcPrrK82
+XlvuzswLvbdoj5Adw2mHTD2PCTSG/Ucbj47kNpfhD4zIZXx+wlB5nsXw8RgMI4Fg
+b6hEuMeeOCCfcgTdepyfvoskbr2YZ4Q+a/6iEC2O0zBX6dgGTKei7on/KV0baZu2
+ZH3o4kh/BN9JeW4GWqIBcNpK
+-----END PRIVATE KEY-----`
